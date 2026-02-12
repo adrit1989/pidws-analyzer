@@ -14,7 +14,7 @@ st.markdown("""
     .main { background-color: #f5f5f5; }
     .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e0e0e0; }
     </style>
-    """, unsafe_allow_index=True)
+    """, unsafe_allow_html=True)
 
 st.title("🛡️ IOCL: PIDWS Historic Trend & Gap Analysis")
 st.markdown("#### Eastern Region Pipelines (ERPL) | Muzaffarpur Station")
