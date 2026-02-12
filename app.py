@@ -13,7 +13,7 @@ st.title("📈 PIDWS Historic Trend & Gap Analysis")
 try:
     connect_str = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
     blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-    container_name = "daily-reports"
+    container_name = "permit-attachments"
     container_client = blob_service_client.get_container_client(container_name)
 except Exception as e:
     st.error("⚠️ Azure Storage Connection Failed. Did you set the Environment Variable?")
