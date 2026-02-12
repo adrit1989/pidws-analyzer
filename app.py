@@ -8,16 +8,28 @@ import os
 st.set_page_config(page_title="PIDWS Trend Analyzer", layout="wide")
 st.title("📈 PIDWS Historic Trend & Gap Analysis")
 
-# --- AZURE CONNECTION ---
-# We get this from Azure Environment Variables (Secure)
+# ==========================================
+# MERGED SECTION: AZURE CONNECTION (ROBUST)
+# ==========================================
+# This replaces the old connection block entirely
 try:
     connect_str = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
     blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-    container_name = "permit-attachments"
+    
+    # 1. Set the container name
+    container_name = "pidws"
+    
+    # 2. Get the client
     container_client = blob_service_client.get_container_client(container_name)
+    
+    # 3. AUTO-FIX: If container doesn't exist, create it immediately
+    if not container_client.exists():
+        container_client.create_container()
+        
 except Exception as e:
-    st.error("⚠️ Azure Storage Connection Failed. Did you set the Environment Variable?")
+    st.error(f"⚠️ Azure Storage Error: {e}")
     st.stop()
+# ==========================================
 
 # --- HELPER FUNCTIONS ---
 def upload_to_blob(file, filename):
@@ -43,8 +55,6 @@ def load_history():
                 df = pd.read_excel(io.BytesIO(file_content))
             
             # Add a 'Report Date' column based on filename or file date
-            # Assuming filename format "05-02-2026-ALARMS.xlsx"
-            # Or just use the blob creation date
             df['File_Date'] = blob.creation_time.date()
             all_data.append(df)
             
@@ -61,10 +71,10 @@ with tab1:
     uploaded_file = st.file_uploader("Choose Excel File", type=['xlsx', 'csv'])
     
     if uploaded_file:
-        # 1. Process Logic (Same as before)
+        # 1. Process Logic
         df = pd.read_excel(uploaded_file)
         
-        # ... [Insert your SOP Analysis Logic here] ...
+        # Display the data
         st.dataframe(df.head())
         
         # 2. Save to Azure Blob Button
@@ -89,7 +99,7 @@ with tab2:
                 # Calculate Violations
                 history_df['Response_Time'] = (history_df['Verification Date/Time'] - history_df['Alert Time']).dt.total_seconds() / 60
                 history_df['Is_Late'] = history_df['Response_Time'] > 30
-                history_df['Is_Unverified'] = (history_df['Severity'] == 'high') & (history_df['Verification Date/Time'].isna())
+                history_df['Is_Unverified'] = (history_df['Severity'].astype(str).str.lower() == 'high') & (history_df['Verification Date/Time'].isna())
                 
                 # Group by Date
                 daily_stats = history_df.groupby('File_Date').agg(
