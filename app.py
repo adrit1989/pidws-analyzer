@@ -81,6 +81,19 @@ def process_alarm_df(file_content, filename):
             df['Is_High'] = df['Severity_Clean'].str.contains('high')
             df['Is_Critical_Gap'] = (df['Is_High']) & (df['Verification Date/Time'].isna())
             
+            # PARSE DURATION FOR ADVANCED FORENSICS
+            def parse_duration(time_str):
+                try:
+                    h, m, s = map(int, str(time_str).split(':'))
+                    return h * 60 + m + s / 60
+                except:
+                    return 0
+            
+            if 'Alert Duration(HH:MM:SS)' in df.columns:
+                df['Duration_Mins'] = df['Alert Duration(HH:MM:SS)'].apply(parse_duration)
+            else:
+                df['Duration_Mins'] = 0
+
             return df
             
     except Exception:
@@ -93,12 +106,13 @@ def upload_to_azure(file, filename):
     blob_client.upload_blob(file, overwrite=True)
     st.success(f"✅ {filename} saved to historic database.")
 
+# Cache this function so it doesn't reload on every click
+@st.cache_data(ttl=600) 
 def get_historic_data():
     all_dfs = []
     blobs = container_client.list_blobs()
     
     for blob in blobs:
-        # Accept Excel & CSV files in history
         if "ALARM" in blob.name.upper() or blob.name.endswith(('.xlsx', '.xls')):
             try:
                 b_client = container_client.get_blob_client(blob)
@@ -136,12 +150,13 @@ with tab1:
             c2.metric("Critical Gaps", df_preview['Is_Critical_Gap'].sum())
             c3.metric("SOP Violations", df_preview['SOP_Violation'].sum())
             
-            # Show preview without index
             st.dataframe(df_preview[['Section', 'Alert Time', 'Alert Type/Severity', 'Event Type']].head(10), hide_index=True)
             
             if st.button("💾 Commit to Azure History"):
                 uploaded_file.seek(0)
                 upload_to_azure(uploaded_file, uploaded_file.name)
+                # Clear cache so new file appears immediately in analysis
+                st.cache_data.clear()
         else:
             st.error("Error: Could not find required columns. Ensure this is the correct Alarm Log.")
 
@@ -176,78 +191,114 @@ with tab2:
         else:
             st.warning("No valid alarm history found. (Check if uploaded files have correct columns/sheets)")
 
-# === TAB 3: VULNERABILITY MAP (UPDATED WITH 1KM LOGIC) ===
+# === TAB 3: VULNERABILITY MAP (CORRECTED) ===
 with tab3:
     st.header("Pipeline Risk Analysis")
     
+    # 1. Initialize Session State for Data Persistence
+    if 'vuln_data' not in st.session_state:
+        st.session_state.vuln_data = pd.DataFrame()
+    if 'analysis_active' not in st.session_state:
+        st.session_state.analysis_active = False
+
+    # 2. Button to Load Data (Only runs once)
     if st.button("🔍 Analyze Vulnerabilities"):
-        hist_df = get_historic_data()
-        if not hist_df.empty:
+        with st.spinner("Scanning historic records..."):
+            data = get_historic_data()
+            if not data.empty:
+                st.session_state.vuln_data = data
+                st.session_state.analysis_active = True
+            else:
+                st.warning("No data found in history.")
+
+    # 3. Persistent Analysis View (Runs whenever 'analysis_active' is True)
+    if st.session_state.analysis_active:
+        hist_df = st.session_state.vuln_data
+        
+        # --- LEVEL 1: MACRO ANALYSIS ---
+        st.subheader("1. Macro-Analysis: Most Vulnerable Sections")
+        hotspots = hist_df[hist_df['Is_Critical_Gap']].groupby('Section').size().reset_index(name='Gap_Count')
+        hotspots = hotspots.sort_values(by='Gap_Count', ascending=False)
+        st.bar_chart(hotspots.set_index('Section'))
+        
+        st.divider()
+        
+        # --- LEVEL 2: MICRO ANALYSIS (1 KM STRETCH) ---
+        st.subheader("2. Micro-Analysis: Top 5 Vulnerable 1 KM Stretches")
+        st.markdown("*Scoring Formula: No. of High Alarms + No. of Unverified High Alarms*")
+        
+        # Dropdown uses the persistent dataframe
+        unique_sections = hist_df['Section'].dropna().unique()
+        selected_section = st.selectbox("Select Pipeline Section to Audit:", unique_sections)
+        
+        if selected_section:
+            section_df = hist_df[hist_df['Section'] == selected_section].copy()
             
-            # --- LEVEL 1: MACRO ANALYSIS (SECTION LEVEL) ---
-            st.subheader("1. Macro-Analysis: Most Vulnerable Sections")
-            hotspots = hist_df[hist_df['Is_Critical_Gap']].groupby('Section').size().reset_index(name='Gap_Count')
-            hotspots = hotspots.sort_values(by='Gap_Count', ascending=False)
-            st.bar_chart(hotspots.set_index('Section'))
-            
-            st.divider()
-            
-            # --- LEVEL 2: MICRO ANALYSIS (1 KM STRETCH LEVEL) ---
-            st.subheader("2. Micro-Analysis: Top 5 Vulnerable 1 KM Stretches")
-            st.markdown("*Scoring Formula: No. of High Alarms + No. of Unverified High Alarms*")
-            
-            # Get unique sections for dropdown
-            unique_sections = hist_df['Section'].dropna().unique()
-            selected_section = st.selectbox("Select Pipeline Section to Audit:", unique_sections)
-            
-            if selected_section:
-                # 1. Filter Data for Section
-                section_df = hist_df[hist_df['Section'] == selected_section].copy()
+            if 'LPG . No.' in section_df.columns:
+                section_df['KM_Raw'] = pd.to_numeric(section_df['LPG . No.'], errors='coerce')
+                section_df = section_df.dropna(subset=['KM_Raw'])
                 
-                # 2. Clean & Bucket LPG No (KM Stone)
-                # Ensure 'LPG . No.' exists and is numeric
-                if 'LPG . No.' in section_df.columns:
-                    section_df['KM_Raw'] = pd.to_numeric(section_df['LPG . No.'], errors='coerce')
-                    section_df = section_df.dropna(subset=['KM_Raw'])
-                    
-                    # Create 1 KM Buckets (e.g., 0.8 -> 0, 1.2 -> 1)
-                    section_df['KM_Start'] = section_df['KM_Raw'].apply(np.floor).astype(int)
-                    section_df['Stretch_Label'] = "KM " + section_df['KM_Start'].astype(str) + " - " + (section_df['KM_Start'] + 1).astype(str)
-                    
-                    # 3. Calculate Metrics per Stretch
-                    stretch_stats = section_df.groupby('Stretch_Label').agg(
-                        High_Alarms=('Is_High', 'sum'),
-                        Unverified_High=('Is_Critical_Gap', 'sum')
-                    ).reset_index()
-                    
-                    # 4. Calculate Vulnerability Score
-                    stretch_stats['Vulnerability_Score'] = stretch_stats['High_Alarms'] + stretch_stats['Unverified_High']
-                    
-                    # 5. Sort & Take Top 5
-                    top_5_stretches = stretch_stats.sort_values(by='Vulnerability_Score', ascending=False).head(5)
-                    
-                    # 6. Display Results
-                    c1, c2 = st.columns([1, 2])
-                    
-                    with c1:
-                        st.markdown(f"**Top Risky Stretches in {selected_section}**")
-                        st.dataframe(top_5_stretches, hide_index=True)
-                    
-                    with c2:
-                        st.markdown("**Vulnerability Graph (Score vs Stretch)**")
-                        # Use Streamlit bar chart
-                        st.bar_chart(top_5_stretches.set_index('Stretch_Label')['Vulnerability_Score'])
-                        
-                else:
-                    st.warning("Could not find 'LPG . No.' column for KM analysis.")
-            
-            # --- RAW DATA VIEW ---
-            with st.expander("View Raw Critical Gap Log"):
-                gap_view = hist_df[hist_df['Is_Critical_Gap']][['Log_Date', 'Section', 'LPG . No.', 'Alert Time', 'Event Type']]
-                st.dataframe(gap_view, hide_index=True)
+                # Bucket into 1 KM
+                section_df['KM_Start'] = section_df['KM_Raw'].apply(np.floor).astype(int)
+                section_df['Stretch_Label'] = "KM " + section_df['KM_Start'].astype(str) + " - " + (section_df['KM_Start'] + 1).astype(str)
                 
-        else:
-            st.write("No data found. Please upload files in Tab 1 first.")
+                stretch_stats = section_df.groupby('Stretch_Label').agg(
+                    High_Alarms=('Is_High', 'sum'),
+                    Unverified_High=('Is_Critical_Gap', 'sum')
+                ).reset_index()
+                
+                stretch_stats['Vulnerability_Score'] = stretch_stats['High_Alarms'] + stretch_stats['Unverified_High']
+                top_5_stretches = stretch_stats.sort_values(by='Vulnerability_Score', ascending=False).head(5)
+                
+                c1, c2 = st.columns([1, 2])
+                with c1:
+                    st.markdown(f"**Top Risky Stretches in {selected_section}**")
+                    st.dataframe(top_5_stretches, hide_index=True)
+                with c2:
+                    st.markdown("**Vulnerability Graph**")
+                    st.bar_chart(top_5_stretches.set_index('Stretch_Label')['Vulnerability_Score'])
+            else:
+                st.warning("Could not find 'LPG . No.' column.")
+        
+        # --- LEVEL 3: ADVANCED FORENSICS ---
+        st.divider()
+        st.header("3. Advanced Forensics")
+        
+        if 'Alert Time' in hist_df.columns:
+            hist_df['Hour'] = hist_df['Alert Time'].dt.hour
+            
+            st.subheader("⏰ The 'Thief's Schedule' (Alarms by Hour)")
+            hourly_risk = hist_df[hist_df['Is_High']].groupby('Hour').size().reset_index(name='Alarm_Count')
+            full_day = pd.DataFrame({'Hour': range(24)})
+            hourly_risk = full_day.merge(hourly_risk, on='Hour', how='left').fillna(0)
+            
+            st.bar_chart(hourly_risk.set_index('Hour'))
+            st.caption("Peaks indicate the most dangerous times of day for this pipeline.")
+
+        st.divider()
+        st.subheader("🔥 Threat Intensity (Duration vs. Location)")
+        
+        if selected_section:
+            bubble_data = hist_df[
+                (hist_df['Section'] == selected_section) & 
+                (hist_df['Is_High']) &
+                (hist_df['Duration_Mins'] > 0)
+            ].copy()
+            
+            if not bubble_data.empty:
+                bubble_data['KM_Point'] = pd.to_numeric(bubble_data['LPG . No.'], errors='coerce')
+                
+                st.markdown("**Longer Duration = Higher Risk (Bubble Size)**")
+                st.scatter_chart(
+                    bubble_data,
+                    x='KM_Point',
+                    y='Duration_Mins',
+                    color='Event Type',
+                    size='Duration_Mins', 
+                )
+                st.caption(f"Visualizing specific incidents in {selected_section}.")
+            else:
+                st.info("No high-severity data with duration available for this section.")
 
 # --- SIDEBAR INFO ---
 with st.sidebar:
