@@ -21,9 +21,8 @@ st.markdown("#### Eastern Region Pipelines (ERPL) | Muzaffarpur Station")
 
 # --- AZURE CONNECTION ---
 try:
-    # Set these in Azure Web App -> Settings -> Environment Variables
     connect_str = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
-    container_name = "pidws" # Change this to your actual container name
+    container_name = "pidws" 
     
     blob_service_client = BlobServiceClient.from_connection_string(connect_str)
     container_client = blob_service_client.get_container_client(container_name)
@@ -35,39 +34,62 @@ except Exception as e:
     st.error("🔴 Azure Storage Connection Failed. Please check Environment Variables.")
     st.stop()
 
-# --- SMART FILE READER (Targets Row 4 Headers) ---
-def process_alarm_df(file_content, is_bytes=True):
+# --- SMART FILE READER (Supports CSV & Excel) ---
+def process_alarm_df(file_content, filename):
     try:
-        # Load file - Row 4 in Excel is Index 3 in Python
-        # We skip the metadata (Revision, Section, Title)
-        input_data = io.BytesIO(file_content) if is_bytes else file_content
-        df = pd.read_csv(input_data, header=4, on_bad_lines='skip')
+        df = None
+        input_data = io.BytesIO(file_content)
         
-        # Clean column names (Remove newlines and extra spaces)
-        df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
-        
-        # Critical Column Check
-        required_cols = ['Alert Time', 'Verification Date/Time', 'Alert Type/Severity']
-        if not all(col in df.columns for col in required_cols):
-            return None
+        # 1. Determine File Type
+        if filename.lower().endswith(('.xls', '.xlsx')):
+            # Read Excel
+            xls = pd.ExcelFile(input_data)
             
-        # Data Cleaning
-        df = df[df['Alert Time'].notna()]
-        # Convert to Datetime
-        df['Alert Time'] = pd.to_datetime(df['Alert Time'], errors='coerce')
-        df['Verification Date/Time'] = pd.to_datetime(df['Verification Date/Time'], errors='coerce')
-        
-        # Calculate Response Metrics
-        df['Response_Time_Mins'] = (df['Verification Date/Time'] - df['Alert Time']).dt.total_seconds() / 60
-        df['SOP_Violation'] = df['Response_Time_Mins'] > 30
-        
-        # Identify Critical Vulnerabilities (High Severity + No Verification)
-        df['Severity_Clean'] = df['Alert Type/Severity'].astype(str).str.lower()
-        df['Is_Critical_Gap'] = (df['Severity_Clean'].str.contains('high')) & (df['Verification Date/Time'].isna())
-        
-        return df
+            # Smart Sheet Selection: Look for a sheet named 'ALARMS' (case insensitive)
+            target_sheet = xls.sheet_names[0] # Default to first sheet
+            for sheet in xls.sheet_names:
+                if "ALARM" in sheet.upper():
+                    target_sheet = sheet
+                    break
+            
+            # Read the specific sheet, Header is at Index 3 (Row 4)
+            df = pd.read_excel(xls, sheet_name=target_sheet, header=3)
+            
+        else:
+            # Read CSV (Header at Index 3)
+            df = pd.read_csv(input_data, header=3, on_bad_lines='skip')
+
+        # 2. Clean Column Names
+        if df is not None:
+            df.columns = [str(c).strip().replace('\n', ' ') for c in df.columns]
+            
+            # 3. Critical Column Check
+            required_cols = ['Alert Time', 'Verification Date/Time', 'Alert Type/Severity']
+            # We relax the check slightly to allow for minor spelling variations if needed
+            if not all(col in df.columns for col in required_cols):
+                return None
+                
+            # 4. Data Cleaning
+            df = df[df['Alert Time'].notna()]
+            
+            # Convert to Datetime (Day First for India Format)
+            df['Alert Time'] = pd.to_datetime(df['Alert Time'], dayfirst=True, errors='coerce')
+            df['Verification Date/Time'] = pd.to_datetime(df['Verification Date/Time'], dayfirst=True, errors='coerce')
+            
+            # Calculate Response Metrics
+            df['Response_Time_Mins'] = (df['Verification Date/Time'] - df['Alert Time']).dt.total_seconds() / 60
+            df['SOP_Violation'] = df['Response_Time_Mins'] > 30
+            
+            # Identify Critical Vulnerabilities (High Severity + No Verification)
+            df['Severity_Clean'] = df['Alert Type/Severity'].astype(str).str.lower()
+            df['Is_Critical_Gap'] = (df['Severity_Clean'].str.contains('high')) & (df['Verification Date/Time'].isna())
+            
+            return df
+            
     except Exception as e:
+        # st.error(f"Error processing {filename}: {e}") # Uncomment for debugging
         return None
+    return None
 
 # --- DATABASE FUNCTIONS ---
 def upload_to_azure(file, filename):
@@ -80,15 +102,21 @@ def get_historic_data():
     blobs = container_client.list_blobs()
     
     for blob in blobs:
-        # Filter: Only process ALARMS logs, ignore Summary and Bikers files
-        if "ALARMS" in blob.name.upper():
-            b_client = container_client.get_blob_client(blob)
-            content = b_client.download_blob().readall()
-            df = process_alarm_df(content)
-            if df is not None:
-                df['Source_File'] = blob.name
-                df['Log_Date'] = blob.creation_time.date()
-                all_dfs.append(df)
+        # We now accept Excel files in history too
+        if "ALARM" in blob.name.upper() or blob.name.endswith(('.xlsx', '.xls')):
+            try:
+                b_client = container_client.get_blob_client(blob)
+                content = b_client.download_blob().readall()
+                
+                # Pass filename so we know how to parse it (CSV vs Excel)
+                df = process_alarm_df(content, blob.name)
+                
+                if df is not None:
+                    df['Source_File'] = blob.name
+                    df['Log_Date'] = blob.creation_time.date()
+                    all_dfs.append(df)
+            except Exception:
+                continue
     
     return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
@@ -98,18 +126,18 @@ tab1, tab2, tab3 = st.tabs(["📤 Daily Upload", "📈 Trend Analytics", "⚠️
 # === TAB 1: DAILY UPLOAD ===
 with tab1:
     st.header("Upload New PIDWS Alarm Log")
-    st.info("Ensure you are uploading the '... - ALARMS.csv' file.")
+    st.info("Supported formats: .xlsx, .xls, .csv")
     
-    uploaded_file = st.file_uploader("Select CSV File", type=['csv'])
+    # Updated to accept Excel files
+    uploaded_file = st.file_uploader("Select File", type=['csv', 'xlsx', 'xls'])
     
     if uploaded_file:
         file_bytes = uploaded_file.getvalue()
-        df_preview = process_alarm_df(file_bytes)
+        df_preview = process_alarm_df(file_bytes, uploaded_file.name)
         
         if df_preview is not None:
             st.success("File validated successfully (Row 4 Headers Detected)")
             
-            # Quick Stats for the uploaded file
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Alarms", len(df_preview))
             c2.metric("Critical Gaps", df_preview['Is_Critical_Gap'].sum())
@@ -121,7 +149,7 @@ with tab1:
                 uploaded_file.seek(0)
                 upload_to_azure(uploaded_file, uploaded_file.name)
         else:
-            st.error("Error: Could not find required columns. Please check if this is the correct ALARMS.csv file.")
+            st.error("Error: Could not find required columns. Ensure this is the correct Alarm Log.")
 
 # === TAB 2: TREND ANALYTICS ===
 with tab2:
@@ -131,7 +159,6 @@ with tab2:
         hist_df = get_historic_data()
         
         if not hist_df.empty:
-            # Aggregate by Date
             daily_stats = hist_df.groupby('Log_Date').agg(
                 Total_Alarms=('Alert Time', 'count'),
                 Avg_Response=('Response_Time_Mins', 'mean'),
@@ -139,14 +166,12 @@ with tab2:
                 SOP_Breaches=('SOP_Violation', 'sum')
             ).reset_index()
             
-            # KPI Summary
             kpi1, kpi2, kpi3 = st.columns(3)
             kpi1.metric("Avg Alarms/Day", round(daily_stats['Total_Alarms'].mean(), 1))
             kpi2.metric("Historic Critical Gaps", daily_stats['Critical_Gaps'].sum())
             kpi3.metric("Compliance Rate", f"{round(100 - (daily_stats['SOP_Breaches'].sum()/daily_stats['Total_Alarms'].sum()*100), 1)}%")
 
-            # Charts
-            st.subheader("Critical Vulnerability Trend (High Severity + No Verification)")
+            st.subheader("Critical Vulnerability Trend")
             st.line_chart(daily_stats, x='Log_Date', y='Critical_Gaps')
 
             st.subheader("Response Latency Trend (Minutes)")
@@ -155,31 +180,28 @@ with tab2:
             st.subheader("Daily Data Summary")
             st.dataframe(daily_stats)
         else:
-            st.warning("No valid alarm history found in Azure.")
+            st.warning("No valid alarm history found. (Check if uploaded files have correct columns/sheets)")
 
 # === TAB 3: VULNERABILITY MAP ===
 with tab3:
     st.header("High-Risk Section Analysis")
-    st.markdown("Identification of recurring 'Blind Spots' in the pipeline Right of Way.")
     
-    if 'hist_df' not in locals():
+    if st.button("🔍 Analyze Vulnerabilities"):
         hist_df = get_historic_data()
-        
-    if not hist_df.empty:
-        # Analyze Hotspots (Sections with most critical gaps)
-        hotspots = hist_df[hist_df['Is_Critical_Gap']].groupby('Section').size().reset_index(name='Gap_Count')
-        hotspots = hotspots.sort_values(by='Gap_Count', ascending=False)
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.subheader("Top 5 Risky Sections")
-            st.bar_chart(hotspots.head(5), x='Section', y='Gap_Count')
-        
-        with col_b:
-            st.subheader("Raw Gap Log")
-            st.dataframe(hist_df[hist_df['Is_Critical_Gap']][['Log_Date', 'Section', 'LPG . No.', 'Alert Time', 'Event Type']])
-    else:
-        st.write("Refresh data in the Trends tab to view analysis.")
+        if not hist_df.empty:
+            hotspots = hist_df[hist_df['Is_Critical_Gap']].groupby('Section').size().reset_index(name='Gap_Count')
+            hotspots = hotspots.sort_values(by='Gap_Count', ascending=False)
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.subheader("Top 5 Risky Sections")
+                st.bar_chart(hotspots.head(5), x='Section', y='Gap_Count')
+            
+            with col_b:
+                st.subheader("Raw Gap Log")
+                st.dataframe(hist_df[hist_df['Is_Critical_Gap']][['Log_Date', 'Section', 'LPG . No.', 'Alert Time', 'Event Type']])
+        else:
+            st.write("Refresh data to view analysis.")
 
 # --- SIDEBAR INFO ---
 with st.sidebar:
@@ -189,4 +211,4 @@ with st.sidebar:
     st.write("**SOP Ref:** SP/SEC/02 (PIDWS)")
     st.write("**Safety Ref:** SP/ML/05 (Excavation)")
     st.divider()
-    st.info("This app identifies gaps in guard verification patterns to prevent unauthorized pipeline intrusion.")
+    st.info("This app identifies gaps in guard verification patterns.")
