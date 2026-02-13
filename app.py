@@ -189,7 +189,13 @@ with tab1:
             k1.metric("Total Events", len(df_preview))
             k2.metric("Critical Gaps", df_preview['Is_Critical_Gap'].sum())
             k3.metric("SOP Violations", df_preview['SOP_Violation'].sum())
-            k4.metric("Avg Response", f"{int(df_preview['Response_Time_Mins'].mean())} min")
+            avg_response = df_preview['Response_Time_Mins'].mean()
+            # Check if avg_response is NaN (happens if no verification times exist)
+            if pd.isna(avg_response):
+                avg_response = 0
+            
+            k4.metric("Avg Response", f"{int(avg_response)} min")
+            #k4.metric("Avg Response", f"{int(df_preview['Response_Time_Mins'].mean())} min")
             
             st.dataframe(df_preview.head(5), use_container_width=True, hide_index=True)
             
