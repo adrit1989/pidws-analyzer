@@ -172,39 +172,63 @@ tab1, tab2, tab3 = st.tabs(["📤  Data Upload", "📈  Executive Dashboard", "�
 # === TAB 1: UPLOAD ===
 with tab1:
     st.markdown("### 📂 Import Daily Logs")
-    st.caption("Upload the daily PIDWS extraction file. System supports .xlsx, .xls, and .csv formats.")
+    st.caption("Upload one or multiple PIDWS extraction files. System supports .xlsx, .xls, and .csv formats.")
     
     with st.container():
-        uploaded_file = st.file_uploader("Drop your file here", type=['csv', 'xlsx', 'xls'], label_visibility="collapsed")
+        # CHANGED: Added accept_multiple_files=True
+        uploaded_files = st.file_uploader("Drop your files here", type=['csv', 'xlsx', 'xls'], 
+                                          label_visibility="collapsed", accept_multiple_files=True)
         
-    if uploaded_file:
-        with st.spinner("Analyzing File Structure..."):
-            df_preview = process_alarm_df(uploaded_file.getvalue(), uploaded_file.name)
+    if uploaded_files:
+        with st.spinner("Analyzing Files..."):
+            all_valid_dfs = []
+            valid_files = [] # To keep track of which file objects are actually good
             
-        if df_preview is not None:
-            st.success("✅ File Validated: Standard PIDWS Format Detected")
+            for file in uploaded_files:
+                # Process each file individually
+                df = process_alarm_df(file.getvalue(), file.name)
+                if df is not None:
+                    all_valid_dfs.append(df)
+                    valid_files.append(file)
             
-            # KPI Cards
+        if all_valid_dfs:
+            # Combine all valid dataframes into one for the preview
+            df_preview = pd.concat(all_valid_dfs, ignore_index=True)
+            
+            st.success(f"✅ {len(valid_files)} File(s) Validated: Standard PIDWS Format Detected")
+            
+            # KPI Cards (Calculated on the combined data)
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total Events", len(df_preview))
             k2.metric("Critical Gaps", df_preview['Is_Critical_Gap'].sum())
             k3.metric("SOP Violations", df_preview['SOP_Violation'].sum())
+            
+            # Safe Mean Calculation (The fix we discussed)
             avg_response = df_preview['Response_Time_Mins'].mean()
-            # Check if avg_response is NaN (happens if no verification times exist)
             if pd.isna(avg_response):
                 avg_response = 0
-            
             k4.metric("Avg Response", f"{int(avg_response)} min")
-            #k4.metric("Avg Response", f"{int(df_preview['Response_Time_Mins'].mean())} min")
             
             st.dataframe(df_preview.head(5), use_container_width=True, hide_index=True)
             
-            if st.button("🚀 Commit to Historic Database", type="primary"):
-                uploaded_file.seek(0)
-                upload_to_azure(uploaded_file, uploaded_file.name)
+            # Upload Button
+            if st.button("🚀 Commit All to Historic Database", type="primary"):
+                progress_text = st.empty()
+                progress_bar = st.progress(0)
+                
+                for i, file in enumerate(valid_files):
+                    file.seek(0) # Reset file pointer before upload
+                    upload_to_azure(file, file.name)
+                    # Update progress
+                    progress = (i + 1) / len(valid_files)
+                    progress_bar.progress(progress)
+                    progress_text.text(f"Uploading {i+1}/{len(valid_files)}: {file.name}")
+                
                 st.cache_data.clear()
+                progress_text.text("✅ All files uploaded successfully!")
+                st.success("Historic Database Updated.")
         else:
-            st.error("❌ Format Error: Missing required columns (Alert Time, Severity, Verification).")
+            st.error("❌ Format Error: None of the uploaded files matched the required columns.")
 
 # === TAB 2: DASHBOARD ===
 with tab2:
